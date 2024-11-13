@@ -38,86 +38,86 @@ type Persister interface {
 	UpdateMetrics(Metrics, ProvisionedThroughput)
 }
 
-type sched struct {
-	BurstPeriod           time.Duration
-	SamplesPerBurstPeriod int
+type Sched struct {
+	burstPeriod           time.Duration
+	samplesPerBurstPeriod int
 
-	Done            chan struct{}
-	Persister       Persister
-	RefreshInterval time.Duration
+	done            chan struct{}
+	persister       Persister
+	refreshInterval time.Duration
 
-	Lock         sync.Mutex
-	BatchRCURate *rate.Limiter
-	BatchWCURate *rate.Limiter
-	LocalRCU     uint64
-	LocalWCU     uint64
-	Samples      []Snapshot
+	lock         sync.Mutex
+	batchRCURate *rate.Limiter
+	batchWCURate *rate.Limiter
+	localRCU     uint64
+	localWCU     uint64
+	samples      []Snapshot
 }
 
-func New(p Persister, refreshInterval time.Duration) *sched {
+func New(p Persister, refreshInterval time.Duration) *Sched {
 
-	res := &sched{
-		BurstPeriod:           300 * time.Second,
-		SamplesPerBurstPeriod: int(math.Round(300_000.0 / float64(refreshInterval.Milliseconds()))),
+	res := &Sched{
+		burstPeriod:           300 * time.Second,
+		samplesPerBurstPeriod: int(math.Round(300_000.0 / float64(refreshInterval.Milliseconds()))),
 
-		Done:            make(chan struct{}, 1),
-		Persister:       p,
-		RefreshInterval: refreshInterval,
+		done:            make(chan struct{}, 1),
+		persister:       p,
+		refreshInterval: refreshInterval,
 
-		BatchWCURate: &rate.Limiter{},
-		Samples:      make([]Snapshot, 0),
+		batchWCURate: &rate.Limiter{},
+		samples:      make([]Snapshot, 0),
 	}
 	go refreshLoop(res)
 	return res
 }
 
-func (s *sched) Close() {
-	s.Lock.Lock()
-	defer s.Lock.Unlock()
-	if s.Done == nil {
+func (s *Sched) Close() {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	if s.done == nil {
 		return
 	}
-	s.Done <- struct{}{}
-	s.Done = nil
+	s.done <- struct{}{}
+	s.done = nil
 }
 
-func refreshLoop(s *sched) {
+func refreshLoop(s *Sched) {
 	for {
 		select {
-		case <-s.Done:
+		case <-s.done:
 			return
-		case <-time.After(s.RefreshInterval):
+		case <-time.After(s.refreshInterval):
 			s.refresh()
 		}
 	}
 }
 
-func (s *sched) UsedWCU(n uint32) {
-	s.Lock.Lock()
-	s.LocalWCU += uint64(n)
-	s.Lock.Unlock()
+func (s *Sched) UsedWCU(n uint32) {
+	s.lock.Lock()
+	s.localWCU += uint64(n)
+	s.lock.Unlock()
 }
 
 // WantWCU tells whether the available burst capacity can accommodate the given number of
 // capacity units. If used, the caller should call UsedWCU() with the used amount.
-func (s *sched) WantWCU(n uint32) bool {
-	return !s.BatchWCURate.AllowN(time.Now(), int(n))
+func (s *Sched) WantWCU(n uint32) bool {
+	return !s.batchWCURate.AllowN(time.Now(), int(n))
 }
 
-func (s *sched) refresh() {
-	pt, ok := s.Persister.GetProvisionedThroughput()
+func (s *Sched) refresh() {
+	pt, ok := s.persister.GetProvisionedThroughput()
 	if !ok {
 		// try again later
 		return
 	}
-	s.Lock.Lock()
-	incRCU := s.LocalRCU
-	incWCU := s.LocalWCU
-	s.LocalRCU = 0
-	s.LocalWCU = 0
-	s.Lock.Unlock()
+	s.lock.Lock()
+	incRCU := s.localRCU
+	incWCU := s.localWCU
+	s.localRCU = 0
+	s.localWCU = 0
+	s.lock.Unlock()
 
-	si, ok := s.Persister.UpdateCountersItem("ADD RCU :incrcu, WCU :incwcu, ReadersPerSamplePeriod :one, WritersPerSamplePeriod :one",
+	si, ok := s.persister.UpdateCountersItem("ADD RCU :incrcu, WCU :incwcu, ReadersPerSamplePeriod :one, WritersPerSamplePeriod :one",
 		map[string]uint64{
 			":incrcu": incRCU,
 			":incwcu": incWCU,
@@ -125,38 +125,38 @@ func (s *sched) refresh() {
 		})
 	if !ok {
 		// try again later
-		s.Lock.Lock()
-		s.LocalRCU += incRCU
-		s.LocalWCU += incWCU
-		s.Lock.Unlock()
+		s.lock.Lock()
+		s.localRCU += incRCU
+		s.localWCU += incWCU
+		s.lock.Unlock()
 		return
 	}
 	t := time.Now()
-	s.Lock.Lock()
-	defer s.Lock.Unlock()
-	s.Samples = append(s.Samples, Snapshot{
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	s.samples = append(s.samples, Snapshot{
 		ProvisionedGauge: pt,
 		CountersItem:     si,
 		Time:             t,
 	})
 	metrics := s.updateTargets()
-	s.Persister.UpdateMetrics(metrics, pt)
+	s.persister.UpdateMetrics(metrics, pt)
 }
 
-func (s *sched) updateTargets() Metrics {
-	if len(s.Samples) > s.SamplesPerBurstPeriod {
-		s.Samples = s.Samples[len(s.Samples)-s.SamplesPerBurstPeriod:]
+func (s *Sched) updateTargets() Metrics {
+	if len(s.samples) > s.samplesPerBurstPeriod {
+		s.samples = s.samples[len(s.samples)-s.samplesPerBurstPeriod:]
 	}
-	intervals, metrics := RecalculateIntervalsAndMetrics(s.Samples)
+	intervals, metrics := RecalculateIntervalsAndMetrics(s.samples)
 	if intervals.RCUInterval.Nanoseconds() == 0 {
-		s.BatchRCURate = &rate.Limiter{}
+		s.batchRCURate = &rate.Limiter{}
 	} else {
-		s.BatchRCURate = rate.NewLimiter(rate.Every(intervals.RCUInterval), int(s.BurstPeriod/intervals.RCUInterval)/metrics.Readers+1)
+		s.batchRCURate = rate.NewLimiter(rate.Every(intervals.RCUInterval), int(s.burstPeriod/intervals.RCUInterval)/metrics.Readers+1)
 	}
 	if intervals.WCUInterval.Nanoseconds() == 0 {
-		s.BatchWCURate = &rate.Limiter{}
+		s.batchWCURate = &rate.Limiter{}
 	} else {
-		s.BatchWCURate = rate.NewLimiter(rate.Every(intervals.WCUInterval), int(s.BurstPeriod/intervals.WCUInterval)/metrics.Writers+1)
+		s.batchWCURate = rate.NewLimiter(rate.Every(intervals.WCUInterval), int(s.burstPeriod/intervals.WCUInterval)/metrics.Writers+1)
 	}
 	return metrics
 }
